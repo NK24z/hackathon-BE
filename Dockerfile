@@ -6,7 +6,7 @@ COPY . .
 RUN go build -o main .
 
 FROM debian:bullseye-slim
-ENV PORT=8080
+ENV PORT=8000
 WORKDIR /
 COPY --from=builder /app/main .
 EXPOSE 8080
