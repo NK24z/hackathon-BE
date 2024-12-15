@@ -1,12 +1,13 @@
 package main
 
 import (
+	"cloud.google.com/go/vertexai/genai"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"github.com/joho/godotenv"
 	"github.com/oklog/ulid"
-
 	"log"
 	"math/rand"
 	"net/http"
@@ -21,28 +22,17 @@ import (
 type UserResForHTTPGet struct {
 	Id   string `json:"id"`
 	Name string `json:"name"`
-	Mail string `json:"email"`
+	Mail string `json:"mail"`
 }
 
 type Reply struct {
-	Id       string `json:"id"`
-	Content  string `json:"content"`
-	UserName string `json:"user_id"`
+	Id      string `json:"id"`
+	Content string `json:"content"`
+	//UserName string `json:"user_id"`
 }
 
 type Like struct {
-	Id       string `json:"id"`
-	PostId   string `json:"post_id"`
-	UserName string `json:"user_id"`
-}
-
-type PostWithRepliesAndLikes struct {
-	Id        string  `json:"id"`
-	Content   string  `json:"content"`
-	UserName  string  `json:"user_id"`
-	Replies   []Reply `json:"replies"`
-	Likes     []Like  `json:"likes"`
-	LikeCount int     `json:"like_count"`
+	PostId string `json:"id"`
 }
 
 type Post struct {
@@ -50,6 +40,21 @@ type Post struct {
 	Content  string `json:"content"`
 	UserName string `json:"user_id"`
 }
+
+type Request struct {
+	Email string `json:"email"`
+}
+
+type Response struct {
+	Username string `json:"username"`
+	Error    string `json:"error,omitempty"`
+}
+
+const (
+	location  = "us-central1"
+	modelName = "gemini-1.5-flash-002"
+	projectID = "term6-kokuryo-natsumi" // ① 自分のプロジェクトIDを指定する
+)
 
 var db *sql.DB
 
@@ -91,7 +96,15 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 
-		rows, err := db.Query("SELECT id, name FROM userEx")
+		mail := r.URL.Query().Get("mail")
+		log.Println(mail)
+		if mail == "" {
+			log.Println("fail: email is empty")
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		rows, err := db.Query("SELECT id, name, mail FROM userEx WHERE mail = ?", mail)
 		if err != nil {
 			log.Printf("fail: db.Query, %v\n", err)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -177,14 +190,13 @@ func postHandler(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		// 投稿データ、ユーザー名、いいねの個数を取得
+		// 投稿データといいねの個数を取得
 		rows, err := db.Query(`
-            SELECT p.id, p.content, u.name, COUNT(l.id) AS like_count
-            FROM posts p
-            JOIN userEx u ON p.user_id = u.id
-            LEFT JOIN likes l ON p.id = l.post_id
-            GROUP BY p.id, u.name
-        `)
+			SELECT p.id, p.content, COUNT(l.id) AS like_count
+			FROM posts p
+			LEFT JOIN likes l ON p.id = l.post_id
+			GROUP BY p.id, p.content
+		`)
 		if err != nil {
 			log.Printf("fail: db.Query(posts), %v\n", err)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -196,19 +208,18 @@ func postHandler(w http.ResponseWriter, r *http.Request) {
 
 		for rows.Next() {
 			var post PostWithRepliesAndLikes
-			if err := rows.Scan(&post.Id, &post.Content, &post.UserName, &post.LikeCount); err != nil {
+			if err := rows.Scan(&post.Id, &post.Content, &post.LikeCount); err != nil {
 				log.Printf("fail: rows.Scan(posts), %v\n", err)
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
 
-			// 返信データとユーザー名を取得
+			//返信データを取得
 			replyRows, err := db.Query(`
-                SELECT r.id, r.content, u.name
-                FROM replies r
-                JOIN userEx u ON r.user_id = u.id
-                WHERE r.post_id = ?
-            `, post.Id)
+				SELECT r.id, r.content
+				FROM replies r
+				WHERE r.parent_id = ?
+			`, post.Id)
 			if err != nil {
 				log.Printf("fail: db.Query(replies), %v\n", err)
 				w.WriteHeader(http.StatusInternalServerError)
@@ -219,23 +230,21 @@ func postHandler(w http.ResponseWriter, r *http.Request) {
 			replies := make([]Reply, 0)
 			for replyRows.Next() {
 				var reply Reply
-				if err := replyRows.Scan(&reply.Id, &reply.Content, &reply.UserName); err != nil {
+				if err := replyRows.Scan(&reply.Id, &reply.Content); err != nil {
 					log.Printf("fail: rows.Scan(replies), %v\n", err)
 					w.WriteHeader(http.StatusInternalServerError)
 					return
 				}
 				replies = append(replies, reply)
 			}
-
 			post.Replies = replies
 
-			// いいねデータとユーザー名を取得
+			// いいねデータを取得
 			likeRows, err := db.Query(`
-                SELECT l.id, u.name
-                FROM likes l
-                JOIN userEx u ON l.user_id = u.id
-                WHERE l.post_id = ?
-            `, post.Id)
+				SELECT l.id
+				FROM likes l
+				WHERE l.post_id = ?
+			`, post.Id)
 			if err != nil {
 				log.Printf("fail: db.Query(likes), %v\n", err)
 				w.WriteHeader(http.StatusInternalServerError)
@@ -246,16 +255,24 @@ func postHandler(w http.ResponseWriter, r *http.Request) {
 			likes := make([]Like, 0)
 			for likeRows.Next() {
 				var like Like
-				if err := likeRows.Scan(&like.Id, &like.UserName); err != nil {
+				if err := likeRows.Scan(&like.PostId); err != nil {
 					log.Printf("fail: rows.Scan(likes), %v\n", err)
 					w.WriteHeader(http.StatusInternalServerError)
 					return
 				}
 				likes = append(likes, like)
 			}
-
 			post.Likes = likes
+
 			postsWithRepliesAndLikes = append(postsWithRepliesAndLikes, post)
+		}
+
+		if len(postsWithRepliesAndLikes) == 0 {
+			log.Println("No data found in posts query")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("[]")) // 空のJSONレスポンスを返す
+			return
 		}
 
 		// JSONに変換して返す
@@ -268,13 +285,24 @@ func postHandler(w http.ResponseWriter, r *http.Request) {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(bytes)
+
 	case http.MethodPost:
 		var p Post // 新しいリソース構造体
 		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 			log.Printf("fail: json.NewDecoder.Decode, %v\n", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		// 投稿内容をGeminiを使って添削
+		correctedContent, err := generateCorrectedContent(p.Content)
+		if err != nil {
+			log.Printf("fail: generateCorrectedContent, %v\n", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+		str := fmt.Sprintf("%v", correctedContent)
+		p.Content = str // 添削後の内容を反映
 
 		t := time.Now().UTC()
 		entropy := ulid.Monotonic(rand.New(rand.NewSource(t.UnixNano())), 0)
@@ -300,6 +328,9 @@ func postHandler(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte("Post created successfully"))
 	default:
 		log.Printf("fail: HTTP Method is %s\n", r.Method)
 		w.WriteHeader(http.StatusBadRequest)
@@ -307,9 +338,35 @@ func postHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func generateCorrectedContent(content string) (genai.Part, error) {
+	// Gemini APIを使って投稿内容を添削
+
+	ctx := context.Background()
+	client, err := genai.NewClient(ctx, projectID, location)
+	if err != nil {
+		return nil, fmt.Errorf("error creating client: %w", err)
+	}
+
+	gemini := client.GenerativeModel(modelName)
+	prompt := genai.Text("短いものはそのままにし、長い場合は以下の文章を添削し、50文字以下にしてください:\n" + content)
+	resp, err := gemini.GenerateContent(ctx, prompt)
+	if err != nil {
+		return nil, fmt.Errorf("error generating content: %w", err)
+	}
+	text := resp.Candidates[0].Content.Parts[0]
+
+	rb, err := json.MarshalIndent(resp, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("json.MarshalIndent: %w", err)
+	}
+	fmt.Println(string(rb))
+
+	return text, nil
+}
+
 func likeHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Methods", "POST,GET,OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
 	if r.Method == http.MethodOptions {
@@ -326,12 +383,19 @@ func likeHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// いいねIDを生成
+		// `post_id` のバリデーション
+		if like.PostId == "" {
+			log.Printf("fail: post_id is empty\n")
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		// サーバー側でULIDを生成
 		t := time.Now().UTC()
 		entropy := ulid.Monotonic(rand.New(rand.NewSource(t.UnixNano())), 0)
-		likeId := ulid.MustNew(ulid.Timestamp(t), entropy).String()
+		generatedId := ulid.MustNew(ulid.Timestamp(t), entropy).String()
 
-		// データベースにいいねを挿入
+		// データベースに挿入
 		tx, err := db.Begin()
 		if err != nil {
 			log.Printf("fail: db.Begin, %v\n", err)
@@ -340,9 +404,9 @@ func likeHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		_, err = tx.Exec(`
-            INSERT INTO likes (id, post_id, user_id)
-            VALUES (?, ?, ?)
-        `, likeId, like.PostId, like.UserName)
+            INSERT INTO likes (id, post_id)
+            VALUES (?, ?)
+        `, generatedId, like.PostId)
 		if err != nil {
 			tx.Rollback()
 			log.Printf("fail: tx.Exec, %v\n", err)
@@ -359,7 +423,10 @@ func likeHandler(w http.ResponseWriter, r *http.Request) {
 		// 成功レスポンス
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "like added"})
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "like added",
+			"id":     generatedId, // 生成したULIDをレスポンスで返す
+		})
 	} else {
 		log.Printf("fail: HTTP Method is %s\n", r.Method)
 		w.WriteHeader(http.StatusBadRequest)
@@ -367,10 +434,121 @@ func likeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func replyHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
+	w.Header().Set("Access-Control-Allow-Methods", "POST,GET,OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if r.Method == http.MethodPost {
+		var reply struct {
+			ID      string `json:"id"`
+			Content string `json:"content"`
+		}
+
+		// リクエストボディからデータをデコード
+		if err := json.NewDecoder(r.Body).Decode(&reply); err != nil {
+			log.Printf("fail: json.NewDecoder.Decode, %v\n", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		// 返信IDを生成
+		t := time.Now().UTC()
+		entropy := ulid.Monotonic(rand.New(rand.NewSource(t.UnixNano())), 0)
+		replyID := ulid.MustNew(ulid.Timestamp(t), entropy).String()
+
+		// データベースに返信を挿入
+		tx, err := db.Begin()
+		if err != nil {
+			log.Printf("fail: db.Begin, %v\n", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		_, err = tx.Exec(`
+            INSERT INTO replies (id, parent_id, content)
+            VALUES (?, ?, ?)
+        `, replyID, reply.ID, reply.Content)
+		if err != nil {
+			tx.Rollback()
+			log.Printf("fail: tx.Exec, %v\n", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		if err := tx.Commit(); err != nil {
+			log.Printf("fail: tx.Commit, %v\n", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		// 成功レスポンス
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "reply added"})
+	} else {
+		log.Printf("fail: HTTP Method is %s\n", r.Method)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+}
+
+func handlerGetName(w http.ResponseWriter, r *http.Request) {
+	// CORSヘッダーの設定
+	w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	// OPTIONSリクエストの場合はヘッダーを返して終了
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// リクエストボディのデコード
+	var req Request
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
+
+	// データベースからユーザー名を取得
+	username, err := getUsernameByEmail(db, req.Email)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			json.NewEncoder(w).Encode(Response{Error: "User not found"})
+			return
+		}
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// レスポンスを返す
+	json.NewEncoder(w).Encode(Response{Username: username})
+}
+
+func getUsernameByEmail(db *sql.DB, mail string) (string, error) {
+	var username string
+	query := "SELECT name FROM userEx WHERE mail = ?"
+	if err := db.QueryRow(query, mail).Scan(&username); err != nil {
+		return "", err
+	}
+	return username, nil
+}
+
 func main() {
 	http.HandleFunc("/user", handler)
 	http.HandleFunc("/post", postHandler)
 	http.HandleFunc("/like", likeHandler)
+	http.HandleFunc("/get-username", handlerGetName)
+	http.HandleFunc("/get-mail", handler)
+	http.HandleFunc("/comment", replyHandler)
+
 	closeDBWithSysCall()
 
 	log.Println("Listening...")
