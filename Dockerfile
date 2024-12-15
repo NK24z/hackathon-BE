@@ -1,6 +1,6 @@
 FROM golang:1.21 AS builder
 WORKDIR /app  # アプリケーションの作業ディレクトリを設定（この場合、アプリケーションコードはルートにありますが、/app ディレクトリ内で作業します）
-COPY go.mod go.sum /..  # 必要な依存関係をコピー
+COPY go.mod go.sum ../  # 必要な依存関係をコピー
 RUN go mod download    # 依存関係をダウンロード
 COPY . .               # 残りのソースコード（main.goを含む）をコピー
 RUN go build -o main .  # バイナリを /app/main に生成
